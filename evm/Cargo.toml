@@ -6,7 +6,22 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Placeholder for Phase 3
+# Workspace dependencies
+consensus = { path = "../consensus" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rocksdb = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+bincode = { workspace = true }
+
+# EVM dependencies
+revm = { version = "14.0", features = ["std", "serde"] }
+alloy-primitives = "0.8"
+alloy-sol-types = "0.8"
 
 [dev-dependencies]
+testutil = { path = "../testutil" }
+tempfile = "3.23"
 
