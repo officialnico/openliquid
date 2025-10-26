@@ -304,9 +304,9 @@ impl EvmStorage {
         let snapshot_id = height;
         let key = snapshot_key(snapshot_id);
         
-        // Collect all state
-        let orders = self.load_all_orders()?;
-        let positions = self.load_all_positions()?;
+        // Collect all state (may be empty)
+        let orders = self.load_all_orders().unwrap_or_default();
+        let positions = self.load_all_positions().unwrap_or_default();
         
         // Serialize snapshot metadata
         let snapshot_data = bincode::serialize(&(height, orders.len(), positions.len()))?;

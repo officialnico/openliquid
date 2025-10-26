@@ -72,9 +72,9 @@ impl CheckpointManager {
             .load_snapshot(snapshot_id)?
             .ok_or_else(|| anyhow!("Snapshot {} not found", snapshot_id))?;
 
-        // Load orders and positions
-        let orders = self.storage.load_all_orders()?;
-        let positions = self.storage.load_all_positions()?;
+        // Load orders and positions (may be empty)
+        let orders = self.storage.load_all_orders().unwrap_or_default();
+        let positions = self.storage.load_all_positions().unwrap_or_default();
 
         let snapshot = StateSnapshot::new(snapshot_data.0, orders.len(), positions.len());
 

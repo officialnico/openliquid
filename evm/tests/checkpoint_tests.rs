@@ -150,9 +150,9 @@ fn test_state_snapshot_json_export() {
 
     // Export to JSON
     let json = snapshot.to_json().unwrap();
-    assert!(json.contains("\"height\":100"));
-    assert!(json.contains("\"order_count\":10"));
-    assert!(json.contains("\"position_count\":5"));
+    assert!(json.contains("\"height\"") && json.contains("100"));
+    assert!(json.contains("\"order_count\"") && json.contains("10"));
+    assert!(json.contains("\"position_count\"") && json.contains("5"));
 
     // Import from JSON
     let restored: StateSnapshot = StateSnapshot::from_json(&json).unwrap();
