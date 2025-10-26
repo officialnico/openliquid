@@ -1,0 +1,11 @@
+[package]
+name = "testutil"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+rand = { workspace = true }
+proptest = { workspace = true }
+

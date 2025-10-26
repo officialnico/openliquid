@@ -1,0 +1,12 @@
+[package]
+name = "evm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Placeholder for Phase 3
+
+[dev-dependencies]
+
