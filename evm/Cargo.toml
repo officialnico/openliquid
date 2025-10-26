@@ -15,6 +15,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 bincode = { workspace = true }
+log = "0.4"
 
 # EVM dependencies
 revm = { version = "14.0", features = ["std", "serde"] }

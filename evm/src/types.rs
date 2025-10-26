@@ -171,6 +171,60 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
+/// State snapshot for checkpointing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub height: u64,
+    pub timestamp: u64,
+    pub order_count: usize,
+    pub position_count: usize,
+}
+
+impl StateSnapshot {
+    /// Create a new snapshot
+    pub fn new(height: u64, order_count: usize, position_count: usize) -> Self {
+        Self {
+            height,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            order_count,
+            position_count,
+        }
+    }
+
+    /// Export to JSON
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Import from JSON
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Order book snapshot for checkpointing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderBookSnapshot {
+    pub asset: Address,
+    pub bid_count: usize,
+    pub ask_count: usize,
+    pub next_order_id: u64,
+}
+
+impl OrderBookSnapshot {
+    pub fn new(asset: Address, bid_count: usize, ask_count: usize, next_order_id: u64) -> Self {
+        Self {
+            asset,
+            bid_count,
+            ask_count,
+            next_order_id,
+        }
+    }
+}
+
 // Constants
 pub const KECCAK_EMPTY: B256 = B256::new([
     0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,

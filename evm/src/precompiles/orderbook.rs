@@ -61,11 +61,11 @@ pub struct Trade {
 #[derive(Debug)]
 pub struct OrderBook {
     /// Buy orders sorted by price (descending)
-    bids: BTreeMap<U256, Vec<Order>>,
+    pub(crate) bids: BTreeMap<U256, Vec<Order>>,
     /// Sell orders sorted by price (ascending)
-    asks: BTreeMap<U256, Vec<Order>>,
+    pub(crate) asks: BTreeMap<U256, Vec<Order>>,
     /// All orders by ID
-    orders: HashMap<u64, Order>,
+    pub(crate) orders: HashMap<u64, Order>,
     /// Next order ID
     next_order_id: u64,
     /// Asset for this order book

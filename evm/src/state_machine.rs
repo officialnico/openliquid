@@ -11,6 +11,7 @@ use consensus::{crypto::Hash, hotstuff::types::Block};
 use rocksdb::DB;
 use std::sync::Arc;
 
+use crate::checkpoint::CheckpointManager;
 use crate::executor::EvmExecutor;
 use crate::storage::EvmStorage;
 use crate::types::{Receipt, Transaction};
@@ -20,6 +21,8 @@ use crate::types::{Receipt, Transaction};
 /// Implements the StateMachine trait from consensus, delegating to EvmExecutor
 pub struct EvmStateMachine {
     executor: EvmExecutor,
+    storage: Arc<EvmStorage>,
+    checkpoint_manager: CheckpointManager,
     current_state: State,
     pending_state: Option<State>,
     pending_receipts: Vec<Receipt>,
@@ -29,16 +32,42 @@ pub struct EvmStateMachine {
 impl EvmStateMachine {
     /// Create a new EVM state machine
     pub fn new(db: Arc<DB>) -> Self {
-        let storage = EvmStorage::new(db);
-        let executor = EvmExecutor::new(storage);
+        Self::new_with_checkpoint_interval(db, 1000)
+    }
+
+    /// Create with custom checkpoint interval
+    pub fn new_with_checkpoint_interval(db: Arc<DB>, checkpoint_interval: u64) -> Self {
+        let storage = Arc::new(EvmStorage::new(db));
+        let executor = EvmExecutor::new(storage.as_ref().clone());
+        let checkpoint_manager = CheckpointManager::new(storage.clone(), checkpoint_interval);
         let genesis = State::genesis();
 
         Self {
             executor,
+            storage,
+            checkpoint_manager,
             current_state: genesis.clone(),
             pending_state: None,
             pending_receipts: Vec::new(),
             history: vec![genesis],
+        }
+    }
+
+    /// Restore from latest checkpoint
+    pub fn restore_from_latest_checkpoint(&mut self) -> Result<Option<u64>, StateError> {
+        if let Some(snapshot_id) = self.checkpoint_manager.find_latest_checkpoint()
+            .map_err(|e| StateError::InvalidTransition(e.to_string()))? {
+            
+            log::info!("Restoring from checkpoint {}", snapshot_id);
+            
+            let _snapshot = self.checkpoint_manager.restore_from_checkpoint(snapshot_id)
+                .map_err(|e| StateError::InvalidTransition(e.to_string()))?;
+            
+            log::info!("Successfully restored from checkpoint {}", snapshot_id);
+            Ok(Some(snapshot_id))
+        } else {
+            log::info!("No checkpoints found");
+            Ok(None)
         }
     }
 
@@ -216,9 +245,20 @@ impl StateMachine for EvmStateMachine {
     fn commit(&mut self) -> Result<Hash, StateError> {
         if let Some(pending) = self.pending_state.take() {
             let hash = pending.root_hash;
+            let height = pending.height;
+            
             self.history.push(pending.clone());
             self.current_state = pending;
             self.pending_receipts.clear();
+            
+            // Check if should create checkpoint
+            if self.checkpoint_manager.should_checkpoint(height) {
+                if let Err(e) = self.checkpoint_manager.create_checkpoint(height) {
+                    log::error!("Failed to create checkpoint at height {}: {}", height, e);
+                    // Don't fail the commit, just log the error
+                }
+            }
+            
             Ok(hash)
         } else {
             Err(StateError::InvalidTransition(

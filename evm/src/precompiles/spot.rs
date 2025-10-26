@@ -1,8 +1,10 @@
 use super::{orderbook::OrderBook, Precompile};
+use crate::storage::EvmStorage;
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Define Solidity interface using alloy
 sol! {
@@ -82,6 +84,8 @@ pub struct SpotPrecompile {
     next_global_id: u64,
     /// Current timestamp
     timestamp: u64,
+    /// Storage backend (optional for persistence)
+    storage: Option<Arc<EvmStorage>>,
 }
 
 impl SpotPrecompile {
@@ -91,7 +95,54 @@ impl SpotPrecompile {
             order_map: HashMap::new(),
             next_global_id: 1,
             timestamp: 0,
+            storage: None,
         }
+    }
+
+    /// Create with storage backend for persistence
+    pub fn new_with_storage(storage: Arc<EvmStorage>) -> Self {
+        Self {
+            order_books: HashMap::new(),
+            order_map: HashMap::new(),
+            next_global_id: 1,
+            timestamp: 0,
+            storage: Some(storage),
+        }
+    }
+
+    /// Restore state from storage
+    pub fn restore_from_storage(&mut self) -> Result<()> {
+        let storage = match &self.storage {
+            Some(s) => s,
+            None => return Ok(()), // No storage, nothing to restore
+        };
+
+        // Load all orders
+        let orders = storage.load_all_orders()?;
+
+        for (order_id, order) in orders {
+            // Update order map
+            self.order_map.insert(order_id, (order.asset, order.id));
+
+            // Get or create book for this asset
+            let book = self.get_or_create_book(order.asset);
+
+            // Re-insert order into book
+            if order.is_buy {
+                book.bids.entry(order.price).or_default().push(order.clone());
+            } else {
+                book.asks.entry(order.price).or_default().push(order.clone());
+            }
+            book.orders.insert(order.id, order);
+        }
+
+        // Update next_global_id
+        if let Some(max_id) = self.order_map.keys().max() {
+            self.next_global_id = max_id + 1;
+        }
+
+        log::info!("Restored {} orders from storage", self.order_map.len());
+        Ok(())
     }
 
     fn get_or_create_book(&mut self, asset: Address) -> &mut OrderBook {
@@ -114,8 +165,13 @@ impl SpotPrecompile {
             return Err(anyhow!("Price must be greater than zero"));
         }
 
-        // Capture timestamp before borrowing book
+        // Capture timestamp and storage before borrowing book
         let timestamp = self.timestamp;
+        let storage = self.storage.clone();
+
+        // Generate global order ID before any borrows
+        let global_id = self.next_global_id;
+        self.next_global_id += 1;
 
         // Get order book for asset
         let book = self.get_or_create_book(asset);
@@ -123,13 +179,18 @@ impl SpotPrecompile {
         // Place order
         let (local_id, trades) = book.place_order(caller, amount, price, is_buy, timestamp);
 
-        // Generate global order ID
-        let global_id = self.next_global_id;
-        self.next_global_id += 1;
-        self.order_map.insert(global_id, (asset, local_id));
-
         // Calculate gas based on number of trades
         let gas_used = PLACE_ORDER_BASE_GAS + (trades.len() as u64 * PLACE_ORDER_MATCH_GAS);
+
+        // Now we can add to order_map (after book is done being used)
+        self.order_map.insert(global_id, (asset, local_id));
+
+        // Persist order if storage is available and order wasn't fully filled
+        if let Some(storage) = storage {
+            if let Some(order) = self.order_books.get(&asset).and_then(|b| b.get_order(local_id)) {
+                storage.store_order(global_id, order)?;
+            }
+        }
 
         Ok((U256::from(global_id), gas_used))
     }
@@ -155,6 +216,12 @@ impl SpotPrecompile {
 
         if cancelled.is_some() {
             self.order_map.remove(&order_id_u64);
+            
+            // Delete from storage if available
+            if let Some(storage) = &self.storage {
+                storage.delete_order(order_id_u64)?;
+            }
+            
             Ok((true, CANCEL_ORDER_GAS))
         } else {
             Err(anyhow!("Failed to cancel order (not owner or already filled)"))

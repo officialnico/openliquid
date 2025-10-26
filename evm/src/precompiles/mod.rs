@@ -1,5 +1,6 @@
 use alloy_primitives::{Address, Bytes};
 use anyhow::Result;
+use std::sync::Arc;
 
 pub mod orderbook;
 pub mod perp;
@@ -27,6 +28,34 @@ pub fn get_precompile(address: &Address) -> Option<Box<dyn Precompile>> {
     match *address {
         SPOT_PRECOMPILE => Some(Box::new(spot::SpotPrecompile::new())),
         PERP_PRECOMPILE => Some(Box::new(perp::PerpPrecompile::new())),
+        _ => None,
+    }
+}
+
+/// Get a precompile instance with storage backend
+pub fn get_precompile_with_storage(
+    address: &Address,
+    storage: Arc<crate::storage::EvmStorage>,
+) -> Option<Box<dyn Precompile>> {
+    match *address {
+        SPOT_PRECOMPILE => {
+            let mut precompile = spot::SpotPrecompile::new_with_storage(storage);
+            // Restore state from storage
+            if let Err(e) = precompile.restore_from_storage() {
+                log::error!("Failed to restore spot precompile state: {}", e);
+                // Continue with empty state
+            }
+            Some(Box::new(precompile))
+        }
+        PERP_PRECOMPILE => {
+            let mut precompile = perp::PerpPrecompile::new_with_storage(storage);
+            // Restore state from storage
+            if let Err(e) = precompile.restore_from_storage() {
+                log::error!("Failed to restore perp precompile state: {}", e);
+                // Continue with empty state
+            }
+            Some(Box::new(precompile))
+        }
         _ => None,
     }
 }

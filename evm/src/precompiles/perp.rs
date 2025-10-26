@@ -1,9 +1,11 @@
 use super::Precompile;
+use crate::storage::EvmStorage;
 use alloy_primitives::{Address, Bytes, I256, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Define Solidity interface for perpetuals
 sol! {
@@ -181,6 +183,8 @@ pub struct PerpPrecompile {
     mark_prices: HashMap<Address, U256>,
     /// Current timestamp
     timestamp: u64,
+    /// Storage backend (optional for persistence)
+    storage: Option<Arc<EvmStorage>>,
 }
 
 impl PerpPrecompile {
@@ -190,7 +194,42 @@ impl PerpPrecompile {
             next_position_id: 1,
             mark_prices: HashMap::new(),
             timestamp: 0,
+            storage: None,
         }
+    }
+
+    /// Create with storage backend for persistence
+    pub fn new_with_storage(storage: Arc<EvmStorage>) -> Self {
+        Self {
+            positions: HashMap::new(),
+            next_position_id: 1,
+            mark_prices: HashMap::new(),
+            timestamp: 0,
+            storage: Some(storage),
+        }
+    }
+
+    /// Restore state from storage
+    pub fn restore_from_storage(&mut self) -> Result<()> {
+        let storage = match &self.storage {
+            Some(s) => s,
+            None => return Ok(()), // No storage, nothing to restore
+        };
+
+        // Load all positions
+        let positions = storage.load_all_positions()?;
+
+        for (pos_id, position) in positions {
+            self.positions.insert(pos_id, position);
+        }
+
+        // Update next_position_id
+        if let Some(max_id) = self.positions.keys().max() {
+            self.next_position_id = max_id + 1;
+        }
+
+        log::info!("Restored {} positions from storage", self.positions.len());
+        Ok(())
     }
 
     /// Set mark price for a market (for testing/simulation)
@@ -244,7 +283,12 @@ impl PerpPrecompile {
             self.timestamp,
         );
 
-        self.positions.insert(position_id, position);
+        self.positions.insert(position_id, position.clone());
+
+        // Persist position if storage is available
+        if let Some(storage) = &self.storage {
+            storage.store_position(position_id, &position)?;
+        }
 
         Ok((U256::from(position_id), OPEN_POSITION_GAS))
     }
@@ -281,6 +325,11 @@ impl PerpPrecompile {
         // Now mark position as closed (separate borrow)
         if let Some(position) = self.positions.get_mut(&position_id_u64) {
             position.is_open = false;
+            
+            // Update position in storage if available
+            if let Some(storage) = &self.storage {
+                storage.store_position(position_id_u64, position)?;
+            }
         }
 
         Ok((pnl, CLOSE_POSITION_GAS))
@@ -319,6 +368,11 @@ impl PerpPrecompile {
         // Now mark position as closed (separate borrow)
         if let Some(position) = self.positions.get_mut(&position_id_u64) {
             position.is_open = false;
+            
+            // Update position in storage if available
+            if let Some(storage) = &self.storage {
+                storage.store_position(position_id_u64, position)?;
+            }
         }
 
         Ok((current_price, LIQUIDATE_GAS))

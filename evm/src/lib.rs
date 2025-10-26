@@ -8,6 +8,7 @@
 // - StateMachine trait implementation for consensus integration
 // - Complete EVM state management
 
+pub mod checkpoint;
 pub mod executor;
 pub mod precompiles;
 pub mod storage;
@@ -15,9 +16,10 @@ pub mod state_machine;
 pub mod types;
 
 // Re-exports for convenience
+pub use checkpoint::CheckpointManager;
 pub use executor::EvmExecutor;
 pub use precompiles::{get_precompile, is_precompile, PERP_PRECOMPILE, SPOT_PRECOMPILE};
 pub use state_machine::EvmStateMachine;
 pub use storage::EvmStorage;
-pub use types::{Account, Block, Receipt, StateTransition, Transaction};
+pub use types::{Account, Block, Receipt, StateSnapshot, StateTransition, Transaction};
 
