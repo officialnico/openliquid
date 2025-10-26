@@ -15,4 +15,3 @@ pub mod sync;
 pub mod checkpoint;
 
 pub use crypto::{BLSSignature, BLSPublicKey, BLSSecretKey, Hash};
-

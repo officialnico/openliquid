@@ -77,7 +77,6 @@ impl Storage {
     }
     
     /// Create an in-memory storage for testing
-    #[cfg(test)]
     pub fn new_temp() -> Result<Self> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| StorageError::InvalidData(e.to_string()))?;

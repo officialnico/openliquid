@@ -36,6 +36,7 @@ anyhow = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+tempfile = "3.8"
 
 [dev-dependencies]
 proptest = { workspace = true }
