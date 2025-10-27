@@ -99,6 +99,45 @@ pub struct Fill {
     pub timestamp: u64,
 }
 
+/// Position tracking for margin trading
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub user: Address,
+    pub asset: AssetId,
+    pub size: i64,  // Positive = long, negative = short
+    pub entry_price: Price,
+    pub realized_pnl: i64,
+    pub unrealized_pnl: i64,
+    pub timestamp: u64,
+}
+
+/// Collateral account for margin trading
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollateralAccount {
+    pub user: Address,
+    pub deposits: std::collections::HashMap<AssetId, U256>,  // Asset -> Amount
+    pub total_value: U256,  // USD value
+    pub used_margin: U256,
+    pub available_margin: U256,
+}
+
+/// Margin requirement levels
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MarginRequirements {
+    pub initial: U256,      // Required to open position
+    pub maintenance: U256,  // Required to keep position open
+}
+
+/// Liquidation event
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Liquidation {
+    pub user: Address,
+    pub asset: AssetId,
+    pub position_size: i64,
+    pub liquidation_price: Price,
+    pub timestamp: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

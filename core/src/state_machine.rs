@@ -1,5 +1,7 @@
 use crate::checkpoint::CheckpointManager;
 use crate::history::OrderHistory;
+use crate::liquidation::LiquidationEngine;
+use crate::margin::{MarginConfig, MarginEngine};
 use crate::matching::MatchingEngine;
 use crate::orderbook::OrderBook;
 use crate::storage::CoreStorage;
@@ -23,6 +25,10 @@ pub struct CoreStateMachine {
     history: Option<OrderHistory>,
     /// Current block height (for checkpointing)
     current_height: u64,
+    /// Margin engine for collateral and position management
+    margin_engine: MarginEngine,
+    /// Liquidation engine for risk management
+    liquidation_engine: LiquidationEngine,
 }
 
 impl CoreStateMachine {
@@ -35,6 +41,22 @@ impl CoreStateMachine {
             checkpoint_mgr: None,
             history: None,
             current_height: 0,
+            margin_engine: MarginEngine::new(MarginConfig::default()),
+            liquidation_engine: LiquidationEngine::new(),
+        }
+    }
+    
+    /// Create a new state machine with custom margin config
+    pub fn new_with_margin_config(config: MarginConfig) -> Self {
+        Self {
+            books: HashMap::new(),
+            balances: HashMap::new(),
+            storage: None,
+            checkpoint_mgr: None,
+            history: None,
+            current_height: 0,
+            margin_engine: MarginEngine::new(config),
+            liquidation_engine: LiquidationEngine::new(),
         }
     }
     
@@ -51,6 +73,8 @@ impl CoreStateMachine {
             checkpoint_mgr: Some(checkpoint_mgr),
             history: Some(history),
             current_height: 0,
+            margin_engine: MarginEngine::new(MarginConfig::default()),
+            liquidation_engine: LiquidationEngine::new(),
         })
     }
     
@@ -305,6 +329,187 @@ impl CoreStateMachine {
         // For now, just track that the fill occurred
         // Full implementation in Phase 3.3 (Margin System)
         let _ = fill;
+    }
+    
+    // ==================== Margin System Methods ====================
+    
+    /// Deposit collateral
+    pub fn deposit_collateral(
+        &mut self,
+        user: Address,
+        asset: AssetId,
+        amount: U256,
+    ) -> Result<()> {
+        self.margin_engine.deposit(user, asset, amount)
+    }
+    
+    /// Withdraw collateral
+    pub fn withdraw_collateral(
+        &mut self,
+        user: Address,
+        asset: AssetId,
+        amount: U256,
+    ) -> Result<()> {
+        self.margin_engine.withdraw(user, asset, amount)
+    }
+    
+    /// Place limit order with margin checks
+    pub fn place_limit_order_with_margin(
+        &mut self,
+        trader: Address,
+        asset: AssetId,
+        side: Side,
+        price: Price,
+        size: Size,
+        timestamp: u64,
+    ) -> Result<(OrderId, Vec<Fill>)> {
+        // Check margin requirements
+        let required_margin = self.margin_engine.calculate_required_margin(
+            asset,
+            size.0.as_limbs()[0],
+            price,
+        )?;
+        
+        if !self.margin_engine.has_available_margin(&trader, required_margin)? {
+            return Err(anyhow::anyhow!("Insufficient margin"));
+        }
+        
+        // Execute order
+        let (order_id, fills) = self.place_limit_order(
+            trader, asset, side, price, size, timestamp
+        )?;
+        
+        // Update positions based on fills
+        for fill in &fills {
+            let size_delta = match side {
+                Side::Bid => fill.size.0.as_limbs()[0] as i64,
+                Side::Ask => -(fill.size.0.as_limbs()[0] as i64),
+            };
+            
+            self.margin_engine.update_position(
+                trader,
+                asset,
+                size_delta,
+                fill.price,
+                timestamp,
+            )?;
+        }
+        
+        Ok((order_id, fills))
+    }
+    
+    /// Place market order with margin checks
+    pub fn place_market_order_with_margin(
+        &mut self,
+        trader: Address,
+        asset: AssetId,
+        side: Side,
+        size: Size,
+        timestamp: u64,
+    ) -> Result<Vec<Fill>> {
+        // For market orders, we check margin based on estimated worst-case price
+        // In a real system, we'd use mark price or best available price
+        let book = self.get_or_create_book(asset);
+        let estimated_price = match side {
+            Side::Bid => book.best_ask().unwrap_or(Price::from_float(1000000.0)),
+            Side::Ask => book.best_bid().unwrap_or(Price::from_float(0.000001)),
+        };
+        
+        let required_margin = self.margin_engine.calculate_required_margin(
+            asset,
+            size.0.as_limbs()[0],
+            estimated_price,
+        )?;
+        
+        if !self.margin_engine.has_available_margin(&trader, required_margin)? {
+            return Err(anyhow::anyhow!("Insufficient margin"));
+        }
+        
+        // Execute order
+        let fills = self.place_market_order(trader, asset, side, size, timestamp)?;
+        
+        // Update positions based on fills
+        for fill in &fills {
+            let size_delta = match side {
+                Side::Bid => fill.size.0.as_limbs()[0] as i64,
+                Side::Ask => -(fill.size.0.as_limbs()[0] as i64),
+            };
+            
+            self.margin_engine.update_position(
+                trader,
+                asset,
+                size_delta,
+                fill.price,
+                timestamp,
+            )?;
+        }
+        
+        Ok(fills)
+    }
+    
+    /// Get account equity
+    pub fn get_account_equity(&self, user: &Address) -> Result<U256> {
+        self.margin_engine.get_account_equity(user)
+    }
+    
+    /// Get user position
+    pub fn get_position(&self, user: &Address, asset: AssetId) -> Option<&Position> {
+        self.margin_engine.get_position(user, asset)
+    }
+    
+    /// Check if account is healthy
+    pub fn is_account_healthy(&self, user: &Address) -> Result<bool> {
+        self.margin_engine.is_account_healthy(user)
+    }
+    
+    /// Check for liquidations
+    pub fn check_liquidations(
+        &mut self,
+        current_prices: &HashMap<AssetId, Price>,
+        timestamp: u64,
+    ) -> Result<Vec<Liquidation>> {
+        // Get all users with collateral accounts
+        let users = self.margin_engine.get_users();
+        
+        let to_liquidate = self.liquidation_engine.check_liquidations(
+            &self.margin_engine,
+            &users,
+            current_prices,
+            timestamp,
+        )?;
+        
+        let mut liquidations = Vec::new();
+        
+        // Execute liquidations
+        for (user, asset) in to_liquidate {
+            if let Some(position) = self.margin_engine.get_position(&user, asset) {
+                let liq = self.liquidation_engine.liquidate_position(
+                    user,
+                    asset,
+                    position.size,
+                    position.entry_price,
+                    timestamp,
+                )?;
+                
+                // Close the position
+                self.margin_engine.update_position(
+                    user,
+                    asset,
+                    -position.size,
+                    position.entry_price,
+                    timestamp,
+                )?;
+                
+                liquidations.push(liq);
+            }
+        }
+        
+        Ok(liquidations)
+    }
+    
+    /// Get liquidation history
+    pub fn get_liquidations(&self) -> &[Liquidation] {
+        self.liquidation_engine.get_liquidations()
     }
 }
 
@@ -894,6 +1099,472 @@ mod tests {
         
         // Cleanup
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    // ==================== Margin System Integration Tests ====================
+
+    #[test]
+    fn test_deposit_collateral() {
+        let mut sm = CoreStateMachine::new();
+        let user = Address::ZERO;
+        
+        sm.deposit_collateral(user, AssetId(1), U256::from(10000)).unwrap();
+        
+        let equity = sm.get_account_equity(&user).unwrap();
+        assert_eq!(equity, U256::from(10000));
+    }
+
+    #[test]
+    fn test_withdraw_collateral() {
+        let mut sm = CoreStateMachine::new();
+        let user = Address::ZERO;
+        
+        sm.deposit_collateral(user, AssetId(1), U256::from(10000)).unwrap();
+        sm.withdraw_collateral(user, AssetId(1), U256::from(3000)).unwrap();
+        
+        let equity = sm.get_account_equity(&user).unwrap();
+        assert_eq!(equity, U256::from(7000));
+    }
+
+    #[test]
+    fn test_withdraw_collateral_insufficient_balance() {
+        let mut sm = CoreStateMachine::new();
+        let user = Address::ZERO;
+        
+        sm.deposit_collateral(user, AssetId(1), U256::from(5000)).unwrap();
+        
+        let result = sm.withdraw_collateral(user, AssetId(1), U256::from(6000));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_place_limit_order_with_margin() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Deposit collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Place order with margin check
+        let (order_id, fills) = sm
+            .place_limit_order_with_margin(
+                trader,
+                asset,
+                Side::Bid,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+        
+        assert!(order_id > 0);
+        assert_eq!(fills.len(), 0);
+    }
+
+    #[test]
+    fn test_place_limit_order_with_insufficient_margin() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Deposit small amount
+        sm.deposit_collateral(trader, AssetId(1), U256::from(5)).unwrap();
+        
+        // Try to place large order - should fail
+        let result = sm.place_limit_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_place_market_order_with_margin() {
+        let mut sm = CoreStateMachine::new();
+        let maker = Address::from([1u8; 20]);
+        let taker = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Setup collateral for both
+        sm.deposit_collateral(maker, AssetId(1), U256::from(10000)).unwrap();
+        sm.deposit_collateral(taker, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Add liquidity
+        sm.place_limit_order(
+            maker,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Execute market order with margin check
+        let fills = sm
+            .place_market_order_with_margin(
+                taker,
+                asset,
+                Side::Bid,
+                Size(U256::from(50)),
+                1,
+            )
+            .unwrap();
+        
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].size.0, U256::from(50));
+    }
+
+    #[test]
+    fn test_position_tracking_after_trade() {
+        let mut sm = CoreStateMachine::new();
+        let maker = Address::from([1u8; 20]);
+        let taker = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Setup collateral
+        sm.deposit_collateral(maker, AssetId(1), U256::from(10000)).unwrap();
+        sm.deposit_collateral(taker, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Add ask order
+        sm.place_limit_order(
+            maker,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Execute bid with margin
+        sm.place_market_order_with_margin(
+            taker,
+            asset,
+            Side::Bid,
+            Size(U256::from(50)),
+            1,
+        )
+        .unwrap();
+        
+        // Check taker's position (long)
+        let position = sm.get_position(&taker, asset).unwrap();
+        assert_eq!(position.size, 50);
+        assert_eq!(position.entry_price, Price::from_float(1.0));
+    }
+
+    #[test]
+    fn test_long_and_short_positions() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let counterparty = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Setup collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        sm.deposit_collateral(counterparty, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Trader goes long
+        sm.place_limit_order(
+            counterparty,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        sm.place_market_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Size(U256::from(50)),
+            1,
+        )
+        .unwrap();
+        
+        let position = sm.get_position(&trader, asset).unwrap();
+        assert_eq!(position.size, 50); // Long 50
+    }
+
+    #[test]
+    fn test_account_health_after_position() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Deposit collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Place order with margin
+        sm.place_limit_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Account should still be healthy
+        assert!(sm.is_account_healthy(&trader).unwrap());
+    }
+
+    #[test]
+    fn test_check_liquidations_healthy_account() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Deposit large collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Small position
+        sm.place_limit_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Price::from_float(1.0),
+            Size(U256::from(10)),
+            0,
+        )
+        .unwrap();
+        
+        let mut prices = HashMap::new();
+        prices.insert(asset, Price::from_float(1.0));
+        
+        let liquidations = sm.check_liquidations(&prices, 0).unwrap();
+        assert_eq!(liquidations.len(), 0);
+    }
+
+    #[test]
+    fn test_get_liquidations() {
+        let sm = CoreStateMachine::new();
+        let liquidations = sm.get_liquidations();
+        assert_eq!(liquidations.len(), 0);
+    }
+
+    #[test]
+    fn test_margin_config_custom() {
+        let config = MarginConfig {
+            initial_margin_ratio: 0.2,  // 20%
+            maintenance_margin_ratio: 0.1,  // 10%
+            max_leverage: 5,
+        };
+        
+        let sm = CoreStateMachine::new_with_margin_config(config);
+        assert_eq!(sm.books.len(), 0);
+    }
+
+    #[test]
+    fn test_full_margin_workflow() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let counterparty = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // 1. Deposit collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        sm.deposit_collateral(counterparty, AssetId(1), U256::from(10000)).unwrap();
+        
+        let equity = sm.get_account_equity(&trader).unwrap();
+        assert_eq!(equity, U256::from(10000));
+        
+        // 2. Open position
+        sm.place_limit_order(
+            counterparty,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        sm.place_market_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Size(U256::from(100)),
+            1,
+        )
+        .unwrap();
+        
+        let position = sm.get_position(&trader, asset).unwrap();
+        assert_eq!(position.size, 100);
+        
+        // 3. Account should be healthy
+        assert!(sm.is_account_healthy(&trader).unwrap());
+        
+        // 4. Try to withdraw (should work)
+        sm.withdraw_collateral(trader, AssetId(1), U256::from(1000)).unwrap();
+        
+        let new_equity = sm.get_account_equity(&trader).unwrap();
+        assert_eq!(new_equity, U256::from(9000));
+    }
+
+    #[test]
+    fn test_margin_prevents_overleveraging() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Small collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(100)).unwrap();
+        
+        // Try to open huge position - should fail
+        let result = sm.place_limit_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Price::from_float(1.0),
+            Size(U256::from(10000)),
+            0,
+        );
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_positions_different_assets() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let counterparty = Address::from([2u8; 20]);
+        let asset1 = AssetId(1);
+        let asset2 = AssetId(2);
+        
+        // Deposit collateral
+        sm.deposit_collateral(trader, AssetId(1), U256::from(10000)).unwrap();
+        sm.deposit_collateral(counterparty, AssetId(1), U256::from(10000)).unwrap();
+        
+        // Add liquidity for asset 1
+        sm.place_limit_order(
+            counterparty,
+            asset1,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Open position on asset 1
+        sm.place_market_order_with_margin(
+            trader,
+            asset1,
+            Side::Bid,
+            Size(U256::from(50)),
+            1,
+        )
+        .unwrap();
+        
+        // Add liquidity for asset 2
+        sm.place_limit_order(
+            counterparty,
+            asset2,
+            Side::Ask,
+            Price::from_float(2.0),
+            Size(U256::from(100)),
+            2,
+        )
+        .unwrap();
+        
+        // Open position on asset 2
+        sm.place_market_order_with_margin(
+            trader,
+            asset2,
+            Side::Bid,
+            Size(U256::from(25)),
+            3,
+        )
+        .unwrap();
+        
+        // Check both positions exist
+        assert!(sm.get_position(&trader, asset1).is_some());
+        assert!(sm.get_position(&trader, asset2).is_some());
+    }
+
+    #[test]
+    fn test_withdraw_blocked_by_margin_requirements() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let counterparty = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Deposit collateral: $1100 (enough for position + buffer)
+        sm.deposit_collateral(trader, AssetId(1), U256::from(1100)).unwrap();
+        sm.deposit_collateral(counterparty, AssetId(1), U256::from(100000)).unwrap();
+        
+        // Open large position: 10000 units @ $1 = $10000 notional, 10% margin = $1000
+        sm.place_limit_order(
+            counterparty,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(10000)),
+            0,
+        )
+        .unwrap();
+        
+        sm.place_market_order_with_margin(
+            trader,
+            asset,
+            Side::Bid,
+            Size(U256::from(10000)),
+            1,
+        )
+        .unwrap();
+        
+        // Margin used: $1000
+        // Maintenance requirement: $1000 * 0.05 = $50
+        // Can withdraw at most: $1100 - $50 = $1050
+        // Try to withdraw $1051 - should fail
+        let result = sm.withdraw_collateral(trader, AssetId(1), U256::from(1051));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_position_with_no_collateral_account() {
+        let sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // No position should exist
+        assert!(sm.get_position(&trader, asset).is_none());
+    }
+
+    #[test]
+    fn test_backward_compatibility_regular_orders() {
+        let mut sm = CoreStateMachine::new();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Old API should still work (no margin checks)
+        let (order_id, fills) = sm
+            .place_limit_order(
+                trader,
+                asset,
+                Side::Bid,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+        
+        assert!(order_id > 0);
+        assert_eq!(fills.len(), 0);
+        
+        // Should work even without collateral deposit
+        let equity_result = sm.get_account_equity(&trader);
+        assert!(equity_result.is_err()); // No account created
     }
 }
 
