@@ -2,26 +2,46 @@
 //
 // Phase 3.1: Order Book Foundation
 // Phase 3.2: Order Book Persistence
+// Phase 3.3: Margin Trading & Liquidations
+// Phase 3.4: Advanced Margin & Perpetuals
+// Phase 3.5: Advanced Trading Features & Optimizations
 //
 // This module provides the foundational order book data structures,
-// matching engine, and persistence layer for the OpenCore DEX.
+// matching engine, persistence layer, and advanced perpetual futures
+// functionality for the OpenCore DEX.
 
+pub mod adl;
+pub mod analytics;
 pub mod checkpoint;
+pub mod fees;
+pub mod funding;
 pub mod history;
+pub mod insurance;
 pub mod liquidation;
 pub mod margin;
 pub mod matching;
+pub mod oracle;
+pub mod orders;
 pub mod orderbook;
+pub mod risk;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
 
 // Re-export commonly used types
+pub use adl::{ADLCandidate, ADLEngine};
+pub use analytics::{Analytics, AssetStats, UserStats};
 pub use checkpoint::CheckpointManager;
+pub use fees::{FeeConfig, FeeEngine, FeeTier};
+pub use funding::{FundingConfig, FundingEngine, FundingPayment};
 pub use history::OrderHistory;
-pub use liquidation::LiquidationEngine;
-pub use margin::{MarginConfig, MarginEngine};
+pub use insurance::InsuranceFund;
+pub use liquidation::{LiquidationEngine, LiquidationMode};
+pub use margin::{MarginConfig, MarginEngine, MarginMode};
+pub use oracle::{OracleConfig, OracleEngine, PriceSource};
+pub use orders::{AdvancedOrder, AdvancedOrderType, OrderManager};
 pub use orderbook::{OrderBook, OrderBookSnapshot, PriceLevel};
+pub use risk::{AssetRiskLimits, LeverageTier, PortfolioRiskLimits, RiskEngine};
 pub use state_machine::CoreStateMachine;
 pub use storage::{CheckpointMetadata, CoreStorage};
 pub use types::{

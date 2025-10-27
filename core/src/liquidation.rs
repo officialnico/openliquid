@@ -1,20 +1,45 @@
 use crate::margin::MarginEngine;
 use crate::types::*;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use std::collections::HashMap;
+
+/// Liquidation mode
+#[derive(Debug, Clone, Copy)]
+pub enum LiquidationMode {
+    Full,     // Liquidate entire position
+    Partial,  // Liquidate only enough to restore health
+}
 
 /// Liquidation engine for undercollateralized positions
 pub struct LiquidationEngine {
     /// Historical liquidations
     liquidations: Vec<Liquidation>,
+    /// Default liquidation mode
+    mode: LiquidationMode,
+    /// Partial liquidation percentage (e.g., 0.25 = 25%)
+    partial_percentage: f64,
 }
 
 impl LiquidationEngine {
     pub fn new() -> Self {
         Self {
             liquidations: Vec::new(),
+            mode: LiquidationMode::Partial,
+            partial_percentage: 0.25,  // 25% at a time
         }
+    }
+    
+    pub fn with_mode(mode: LiquidationMode) -> Self {
+        Self {
+            liquidations: Vec::new(),
+            mode,
+            partial_percentage: 0.25,
+        }
+    }
+    
+    pub fn set_partial_percentage(&mut self, percentage: f64) {
+        self.partial_percentage = percentage.clamp(0.1, 1.0);
     }
     
     /// Check all positions for liquidation
@@ -83,6 +108,63 @@ impl LiquidationEngine {
     /// Get total number of liquidations
     pub fn liquidation_count(&self) -> usize {
         self.liquidations.len()
+    }
+    
+    /// Calculate required liquidation size
+    pub fn calculate_liquidation_size(
+        &self,
+        account_value: U256,
+        used_margin: U256,
+        maintenance_ratio: f64,
+        position_size: i64,
+    ) -> i64 {
+        // If fully undercollateralized, liquidate everything
+        let min_required = (used_margin.as_limbs()[0] as f64 * maintenance_ratio) as u64;
+        if account_value < U256::from(min_required) {
+            return position_size;
+        }
+        
+        // Calculate partial liquidation size
+        match self.mode {
+            LiquidationMode::Full => position_size,
+            LiquidationMode::Partial => {
+                (position_size.abs() as f64 * self.partial_percentage) as i64 * position_size.signum()
+            }
+        }
+    }
+    
+    /// Execute partial liquidation
+    pub fn liquidate_position_partial(
+        &mut self,
+        user: Address,
+        asset: AssetId,
+        _position_size: i64,
+        liquidation_size: i64,
+        price: Price,
+        timestamp: u64,
+    ) -> Result<Liquidation> {
+        let liquidation = Liquidation {
+            user,
+            asset,
+            position_size: liquidation_size,
+            liquidation_price: price,
+            timestamp,
+        };
+        
+        self.liquidations.push(liquidation.clone());
+        
+        Ok(liquidation)
+    }
+    
+    /// Calculate if account is badly undercollateralized
+    pub fn is_badly_undercollateralized(
+        &self,
+        account_value: U256,
+        used_margin: U256,
+        maintenance_ratio: f64,
+    ) -> bool {
+        let min_required = (used_margin.as_limbs()[0] as f64 * maintenance_ratio * 0.5) as u64;
+        account_value < U256::from(min_required)
     }
 }
 
@@ -230,6 +312,105 @@ mod tests {
         ).unwrap();
         
         assert_eq!(to_liquidate.len(), 0);
+    }
+
+    #[test]
+    fn test_partial_liquidation_calculation() {
+        let engine = LiquidationEngine::new();
+        
+        let size = engine.calculate_liquidation_size(
+            U256::from(1000),
+            U256::from(500),
+            0.05,
+            1000,
+        );
+        
+        // Should liquidate 25% (250)
+        assert_eq!(size, 250);
+    }
+
+    #[test]
+    fn test_full_liquidation_when_badly_undercollateralized() {
+        let engine = LiquidationEngine::new();
+        
+        // Account value way below maintenance
+        let size = engine.calculate_liquidation_size(
+            U256::from(10),
+            U256::from(1000),
+            0.05,
+            1000,
+        );
+        
+        // Should liquidate everything
+        assert_eq!(size, 1000);
+    }
+
+    #[test]
+    fn test_partial_liquidation_execution() {
+        let mut engine = LiquidationEngine::new();
+        let user = Address::ZERO;
+        
+        let liquidation = engine.liquidate_position_partial(
+            user,
+            AssetId(1),
+            1000,
+            250,  // Partial liquidation
+            Price::from_float(1.0),
+            0,
+        ).unwrap();
+        
+        assert_eq!(liquidation.position_size, 250);
+        assert_eq!(engine.liquidation_count(), 1);
+    }
+
+    #[test]
+    fn test_badly_undercollateralized_check() {
+        let engine = LiquidationEngine::new();
+        
+        // Way below maintenance
+        assert!(engine.is_badly_undercollateralized(
+            U256::from(10),
+            U256::from(1000),
+            0.05,
+        ));
+        
+        // Not badly undercollateralized
+        assert!(!engine.is_badly_undercollateralized(
+            U256::from(100),
+            U256::from(1000),
+            0.05,
+        ));
+    }
+
+    #[test]
+    fn test_full_liquidation_mode() {
+        let engine = LiquidationEngine::with_mode(LiquidationMode::Full);
+        
+        let size = engine.calculate_liquidation_size(
+            U256::from(1000),
+            U256::from(500),
+            0.05,
+            1000,
+        );
+        
+        // Full mode should liquidate everything
+        assert_eq!(size, 1000);
+    }
+
+    #[test]
+    fn test_set_partial_percentage() {
+        let mut engine = LiquidationEngine::new();
+        
+        engine.set_partial_percentage(0.5);  // 50%
+        
+        let size = engine.calculate_liquidation_size(
+            U256::from(1000),
+            U256::from(500),
+            0.05,
+            1000,
+        );
+        
+        assert_eq!(size, 500);  // 50% liquidation
     }
 }
 

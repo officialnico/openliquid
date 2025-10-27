@@ -3,6 +3,13 @@ use alloy_primitives::{Address, U256};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
+/// Margin mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginMode {
+    Isolated,  // Each position has separate collateral
+    Cross,     // All positions share collateral
+}
+
 /// Margin configuration
 #[derive(Debug, Clone)]
 pub struct MarginConfig {
@@ -31,6 +38,10 @@ pub struct MarginEngine {
     collateral: HashMap<Address, CollateralAccount>,
     /// User positions by asset
     positions: HashMap<(Address, AssetId), Position>,
+    /// Margin mode per user
+    margin_modes: HashMap<Address, MarginMode>,
+    /// Isolated collateral per position
+    isolated_collateral: HashMap<(Address, AssetId), U256>,
 }
 
 impl MarginEngine {
@@ -39,6 +50,8 @@ impl MarginEngine {
             config,
             collateral: HashMap::new(),
             positions: HashMap::new(),
+            margin_modes: HashMap::new(),
+            isolated_collateral: HashMap::new(),
         }
     }
     
@@ -216,6 +229,117 @@ impl MarginEngine {
     /// Get all users with collateral accounts
     pub fn get_users(&self) -> Vec<Address> {
         self.collateral.keys().copied().collect()
+    }
+    
+    /// Set margin mode for user
+    pub fn set_margin_mode(
+        &mut self,
+        user: Address,
+        mode: MarginMode,
+    ) -> Result<()> {
+        // Can only switch if no positions open
+        if self.has_open_positions(&user) {
+            return Err(anyhow!("Cannot change mode with open positions"));
+        }
+        
+        self.margin_modes.insert(user, mode);
+        Ok(())
+    }
+    
+    /// Get margin mode for user
+    pub fn get_margin_mode(&self, user: &Address) -> MarginMode {
+        self.margin_modes.get(user).copied().unwrap_or(MarginMode::Cross)
+    }
+    
+    /// Check if user has open positions
+    pub fn has_open_positions(&self, user: &Address) -> bool {
+        self.positions.iter().any(|((u, _), pos)| u == user && pos.size != 0)
+    }
+    
+    /// Calculate unrealized PnL for position
+    pub fn calculate_unrealized_pnl(
+        &self,
+        position: &Position,
+        mark_price: Price,
+    ) -> i64 {
+        if position.size == 0 {
+            return 0;
+        }
+        
+        let pnl_per_unit = mark_price.0 as i64 - position.entry_price.0 as i64;
+        pnl_per_unit * position.size
+    }
+    
+    /// Update position with mark-to-market PnL
+    pub fn update_position_pnl(
+        &mut self,
+        user: Address,
+        asset: AssetId,
+        mark_price: Price,
+    ) -> Result<()> {
+        if let Some(position) = self.positions.get(&(user, asset)) {
+            let pnl = self.calculate_unrealized_pnl(position, mark_price);
+            if let Some(position) = self.positions.get_mut(&(user, asset)) {
+                position.unrealized_pnl = pnl;
+            }
+        }
+        Ok(())
+    }
+    
+    /// Get total account value including unrealized PnL
+    pub fn get_account_value_with_pnl(
+        &self,
+        user: &Address,
+        mark_prices: &HashMap<AssetId, Price>,
+    ) -> Result<U256> {
+        let mut total = self.get_account_equity(user)?;
+        
+        // Add unrealized PnL from all positions
+        for ((pos_user, asset), position) in &self.positions {
+            if pos_user == user {
+                if let Some(mark_price) = mark_prices.get(asset) {
+                    let pnl = self.calculate_unrealized_pnl(position, *mark_price);
+                    if pnl >= 0 {
+                        total = total.saturating_add(U256::from(pnl as u64));
+                    } else {
+                        total = total.saturating_sub(U256::from((-pnl) as u64));
+                    }
+                }
+            }
+        }
+        
+        Ok(total)
+    }
+    
+    /// Deposit isolated collateral for a specific position
+    pub fn deposit_isolated(
+        &mut self,
+        user: Address,
+        asset: AssetId,
+        amount: U256,
+    ) -> Result<()> {
+        let mode = self.get_margin_mode(&user);
+        if mode != MarginMode::Isolated {
+            return Err(anyhow!("User is not in isolated margin mode"));
+        }
+        
+        let current = self.isolated_collateral.entry((user, asset)).or_insert(U256::ZERO);
+        *current = current.saturating_add(amount);
+        
+        Ok(())
+    }
+    
+    /// Get isolated collateral for position
+    pub fn get_isolated_collateral(&self, user: &Address, asset: AssetId) -> U256 {
+        self.isolated_collateral.get(&(*user, asset)).copied().unwrap_or(U256::ZERO)
+    }
+    
+    /// Get all positions for user
+    pub fn get_user_positions(&self, user: &Address) -> Vec<&Position> {
+        self.positions.iter()
+            .filter(|((u, _), _)| u == user)
+            .map(|(_, pos)| pos)
+            .collect()
     }
     
     /// Update account value (simplified - assumes 1:1 USD pricing)
@@ -502,6 +626,114 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert!(users.contains(&user1));
         assert!(users.contains(&user2));
+    }
+
+    #[test]
+    fn test_cross_margin_mode() {
+        let engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        // Default is cross margin
+        assert_eq!(engine.get_margin_mode(&user), MarginMode::Cross);
+    }
+
+    #[test]
+    fn test_isolated_margin_mode() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.set_margin_mode(user, MarginMode::Isolated).unwrap();
+        assert_eq!(engine.get_margin_mode(&user), MarginMode::Isolated);
+    }
+
+    #[test]
+    fn test_margin_mode_switch_blocked_with_positions() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.deposit(user, AssetId(1), U256::from(1000)).unwrap();
+        engine.update_position(user, AssetId(1), 100, Price::from_float(1.0), 0).unwrap();
+        
+        // Cannot switch with open positions
+        let result = engine.set_margin_mode(user, MarginMode::Isolated);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_unrealized_pnl() {
+        let engine = MarginEngine::new(MarginConfig::default());
+        
+        let position = Position {
+            user: Address::ZERO,
+            asset: AssetId(1),
+            size: 100,
+            entry_price: Price::from_float(1.0),
+            realized_pnl: 0,
+            unrealized_pnl: 0,
+            timestamp: 0,
+        };
+        
+        // Price up = profit for long
+        let pnl = engine.calculate_unrealized_pnl(&position, Price::from_float(1.5));
+        assert!(pnl > 0);
+        
+        // Price down = loss for long
+        let pnl = engine.calculate_unrealized_pnl(&position, Price::from_float(0.5));
+        assert!(pnl < 0);
+    }
+
+    #[test]
+    fn test_update_position_pnl() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.deposit(user, AssetId(1), U256::from(1000)).unwrap();
+        engine.update_position(user, AssetId(1), 100, Price::from_float(1.0), 0).unwrap();
+        
+        engine.update_position_pnl(user, AssetId(1), Price::from_float(1.5)).unwrap();
+        
+        let position = engine.get_position(&user, AssetId(1)).unwrap();
+        assert!(position.unrealized_pnl > 0);
+    }
+
+    #[test]
+    fn test_account_value_with_pnl() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.deposit(user, AssetId(1), U256::from(1000)).unwrap();
+        engine.update_position(user, AssetId(1), 100, Price::from_float(1.0), 0).unwrap();
+        
+        let mut mark_prices = HashMap::new();
+        mark_prices.insert(AssetId(1), Price::from_float(1.5));
+        
+        let account_value = engine.get_account_value_with_pnl(&user, &mark_prices).unwrap();
+        assert!(account_value > U256::from(1000)); // Should include profit
+    }
+
+    #[test]
+    fn test_isolated_collateral_deposit() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.set_margin_mode(user, MarginMode::Isolated).unwrap();
+        engine.deposit_isolated(user, AssetId(1), U256::from(500)).unwrap();
+        
+        let isolated = engine.get_isolated_collateral(&user, AssetId(1));
+        assert_eq!(isolated, U256::from(500));
+    }
+
+    #[test]
+    fn test_get_user_positions() {
+        let mut engine = MarginEngine::new(MarginConfig::default());
+        let user = Address::ZERO;
+        
+        engine.deposit(user, AssetId(1), U256::from(10000)).unwrap();
+        engine.update_position(user, AssetId(1), 100, Price::from_float(1.0), 0).unwrap();
+        engine.update_position(user, AssetId(2), 50, Price::from_float(2.0), 0).unwrap();
+        
+        let positions = engine.get_user_positions(&user);
+        assert_eq!(positions.len(), 2);
     }
 }
 
