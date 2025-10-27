@@ -78,6 +78,10 @@ impl CheckpointManager {
         // Set next_order_id to one past the highest ID we found
         book.next_order_id = max_order_id + 1;
         
+        // IMPORTANT: Update the cache after restoring all orders
+        // This ensures best_bid(), best_ask(), etc. work correctly
+        book.update_cache_after_restore();
+        
         Ok(book)
     }
     

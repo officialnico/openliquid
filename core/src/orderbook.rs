@@ -129,6 +129,12 @@ impl OrderBook {
         }
     }
     
+    /// Public method to update cache after restoration from storage
+    /// This should only be called when manually reconstructing the order book
+    pub fn update_cache_after_restore(&mut self) {
+        self.update_cache();
+    }
+    
     /// Get best bid price (highest buy price) - O(1) cached
     pub fn best_bid(&self) -> Option<Price> {
         self.cache.best_bid.map(|(p, _)| p)
