@@ -11,6 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+rocksdb = { workspace = true }
 
 [dev-dependencies]
 

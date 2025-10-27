@@ -1,9 +1,13 @@
+use crate::checkpoint::CheckpointManager;
+use crate::history::OrderHistory;
 use crate::matching::MatchingEngine;
 use crate::orderbook::OrderBook;
+use crate::storage::CoreStorage;
 use crate::types::*;
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// OpenCore state machine
 pub struct CoreStateMachine {
@@ -11,14 +15,94 @@ pub struct CoreStateMachine {
     books: HashMap<AssetId, OrderBook>,
     /// User balances by asset
     balances: HashMap<(Address, AssetId), U256>,
+    /// Storage layer (optional for in-memory mode)
+    storage: Option<Arc<CoreStorage>>,
+    /// Checkpoint manager
+    checkpoint_mgr: Option<CheckpointManager>,
+    /// Order history manager
+    history: Option<OrderHistory>,
+    /// Current block height (for checkpointing)
+    current_height: u64,
 }
 
 impl CoreStateMachine {
+    /// Create a new in-memory state machine (no persistence)
     pub fn new() -> Self {
         Self {
             books: HashMap::new(),
             balances: HashMap::new(),
+            storage: None,
+            checkpoint_mgr: None,
+            history: None,
+            current_height: 0,
         }
+    }
+    
+    /// Create a new state machine with persistence
+    pub fn new_with_storage(storage_path: &str, checkpoint_interval: u64) -> Result<Self> {
+        let storage = Arc::new(CoreStorage::new(storage_path)?);
+        let checkpoint_mgr = CheckpointManager::new(storage.clone(), checkpoint_interval);
+        let history = OrderHistory::new(storage.clone());
+        
+        Ok(Self {
+            books: HashMap::new(),
+            balances: HashMap::new(),
+            storage: Some(storage),
+            checkpoint_mgr: Some(checkpoint_mgr),
+            history: Some(history),
+            current_height: 0,
+        })
+    }
+    
+    /// Recover state from storage
+    pub fn recover(&mut self) -> Result<Vec<AssetId>> {
+        if let Some(checkpoint_mgr) = &self.checkpoint_mgr {
+            // For now, we need to manually specify which assets to recover
+            // In a real system, we would maintain a list of active assets in storage
+            // This is a simplified implementation
+            let mut recovered_assets = Vec::new();
+            
+            // Try to recover common assets (1-10 for example)
+            for asset_id in 1..=10 {
+                let asset = AssetId(asset_id);
+                if let Ok(Some(_)) = checkpoint_mgr.get_latest_checkpoint(asset) {
+                    let book = checkpoint_mgr.restore_book(asset)?;
+                    self.books.insert(asset, book);
+                    recovered_assets.push(asset);
+                }
+            }
+            
+            Ok(recovered_assets)
+        } else {
+            Ok(vec![])
+        }
+    }
+    
+    /// Set current block height (for checkpointing)
+    pub fn set_height(&mut self, height: u64) {
+        self.current_height = height;
+    }
+    
+    /// Get current block height
+    pub fn get_height(&self) -> u64 {
+        self.current_height
+    }
+    
+    /// Checkpoint all order books if needed
+    pub fn checkpoint_if_needed(&mut self) -> Result<Vec<AssetId>> {
+        if let Some(checkpoint_mgr) = &self.checkpoint_mgr {
+            if checkpoint_mgr.should_checkpoint(self.current_height) {
+                let mut checkpointed = Vec::new();
+                
+                for (asset, book) in &self.books {
+                    checkpoint_mgr.checkpoint_book(book, self.current_height)?;
+                    checkpointed.push(*asset);
+                }
+                
+                return Ok(checkpointed);
+            }
+        }
+        Ok(vec![])
     }
     
     /// Get or create order book for asset
@@ -76,6 +160,51 @@ impl CoreStateMachine {
         Ok((order_id, fills))
     }
     
+    /// Place a limit order with persistence
+    pub fn place_limit_order_persistent(
+        &mut self,
+        trader: Address,
+        asset: AssetId,
+        side: Side,
+        price: Price,
+        size: Size,
+        timestamp: u64,
+    ) -> Result<(OrderId, Vec<Fill>)> {
+        let (order_id, fills) = self.place_limit_order(trader, asset, side, price, size, timestamp)?;
+        
+        // Persist order if storage is available
+        if let Some(storage) = &self.storage {
+            // Get mutable reference to the book
+            if let Some(book) = self.books.get_mut(&asset) {
+                // Find and store the order
+                if let Some(&(order_price, order_side)) = book.order_index_mut().get(&order_id) {
+                    let tree = match order_side {
+                        Side::Bid => book.bids_mut(),
+                        Side::Ask => book.asks_mut(),
+                    };
+                    
+                    if let Some(level) = tree.get(&order_price) {
+                        for order in &level.orders {
+                            if order.id == order_id {
+                                storage.store_order(order)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Store fills using history manager
+            if let Some(history) = &self.history {
+                for fill in &fills {
+                    history.store_fill(fill)?;
+                }
+            }
+        }
+        
+        Ok((order_id, fills))
+    }
+    
     /// Place a market order
     pub fn place_market_order(
         &mut self,
@@ -102,6 +231,27 @@ impl CoreStateMachine {
         Ok(fills)
     }
     
+    /// Place a market order with persistence
+    pub fn place_market_order_persistent(
+        &mut self,
+        trader: Address,
+        asset: AssetId,
+        side: Side,
+        size: Size,
+        timestamp: u64,
+    ) -> Result<Vec<Fill>> {
+        let fills = self.place_market_order(trader, asset, side, size, timestamp)?;
+        
+        // Store fills using history manager
+        if let Some(history) = &self.history {
+            for fill in &fills {
+                history.store_fill(fill)?;
+            }
+        }
+        
+        Ok(fills)
+    }
+    
     /// Cancel an order
     pub fn cancel_order(&mut self, asset: AssetId, order_id: OrderId) -> Result<Order> {
         let book = self
@@ -110,6 +260,27 @@ impl CoreStateMachine {
             .ok_or_else(|| anyhow::anyhow!("Asset not found"))?;
         
         book.cancel_order(order_id)
+    }
+    
+    /// Cancel an order with persistence
+    pub fn cancel_order_persistent(&mut self, asset: AssetId, order_id: OrderId) -> Result<Order> {
+        let order = self.cancel_order(asset, order_id)?;
+        
+        // Delete from storage
+        if let Some(storage) = &self.storage {
+            storage.delete_order(asset, order_id)?;
+        }
+        
+        Ok(order)
+    }
+    
+    /// Get order history (fills for an order)
+    pub fn get_order_fills(&self, order_id: OrderId) -> Result<Vec<Fill>> {
+        if let Some(history) = &self.history {
+            history.get_order_fills(order_id)
+        } else {
+            Ok(vec![])
+        }
     }
     
     /// Get order book snapshot
@@ -478,6 +649,251 @@ mod tests {
             .unwrap();
         
         assert_eq!(id2, id1 + 1);
+    }
+
+    // Persistence tests
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db_path() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("/tmp/openliquid_test_sm_{}_{}", timestamp, counter)
+    }
+
+    #[test]
+    fn test_create_with_storage() {
+        let path = temp_db_path();
+        let sm = CoreStateMachine::new_with_storage(&path, 100);
+        assert!(sm.is_ok());
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_persistent_limit_order() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        let (order_id, fills) = sm
+            .place_limit_order_persistent(
+                trader,
+                asset,
+                Side::Bid,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+        
+        assert!(order_id > 0);
+        assert_eq!(fills.len(), 0);
+        
+        // Check order is in book
+        let book = sm.get_book(asset).unwrap();
+        assert_eq!(book.best_bid(), Some(Price::from_float(1.0)));
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_persistent_market_order() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        let maker = Address::from([1u8; 20]);
+        let taker = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Add liquidity
+        sm.place_limit_order_persistent(
+            maker,
+            asset,
+            Side::Ask,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Execute market order
+        let fills = sm
+            .place_market_order_persistent(
+                taker,
+                asset,
+                Side::Bid,
+                Size(U256::from(50)),
+                1,
+            )
+            .unwrap();
+        
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].size.0, U256::from(50));
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_cancel_order_persistent() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        let (order_id, _) = sm
+            .place_limit_order_persistent(
+                trader,
+                asset,
+                Side::Bid,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+        
+        let order = sm.cancel_order_persistent(asset, order_id).unwrap();
+        assert_eq!(order.id, order_id);
+        
+        // Order should be removed from book
+        let book = sm.get_book(asset).unwrap();
+        assert_eq!(book.best_bid(), None);
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_checkpoint_if_needed() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        let trader = Address::from([1u8; 20]);
+        let asset = AssetId(1);
+        
+        // Add an order
+        sm.place_limit_order_persistent(
+            trader,
+            asset,
+            Side::Bid,
+            Price::from_float(1.0),
+            Size(U256::from(100)),
+            0,
+        )
+        .unwrap();
+        
+        // Set height to checkpoint height
+        sm.set_height(100);
+        
+        // Should checkpoint
+        let checkpointed = sm.checkpoint_if_needed().unwrap();
+        assert_eq!(checkpointed.len(), 1);
+        assert_eq!(checkpointed[0], asset);
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_recover_from_storage() {
+        let path = temp_db_path();
+        
+        // Create and populate
+        {
+            let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+            let trader = Address::from([1u8; 20]);
+            let asset = AssetId(1);
+            
+            sm.place_limit_order_persistent(
+                trader,
+                asset,
+                Side::Bid,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+            
+            sm.set_height(100);
+            sm.checkpoint_if_needed().unwrap();
+        }
+        
+        // Recover
+        {
+            let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+            let recovered = sm.recover().unwrap();
+            
+            assert!(recovered.contains(&AssetId(1)));
+            
+            let book = sm.get_book(AssetId(1)).unwrap();
+            assert_eq!(book.best_bid(), Some(Price::from_float(1.0)));
+        }
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_get_order_fills() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        let maker = Address::from([1u8; 20]);
+        let taker = Address::from([2u8; 20]);
+        let asset = AssetId(1);
+        
+        // Add liquidity
+        let (order_id, _) = sm
+            .place_limit_order_persistent(
+                maker,
+                asset,
+                Side::Ask,
+                Price::from_float(1.0),
+                Size(U256::from(100)),
+                0,
+            )
+            .unwrap();
+        
+        // Execute market order (creates fills)
+        sm.place_market_order_persistent(
+            taker,
+            asset,
+            Side::Bid,
+            Size(U256::from(50)),
+            1,
+        )
+        .unwrap();
+        
+        // Get fills for the order
+        let fills = sm.get_order_fills(order_id).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, order_id);
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_height_management() {
+        let path = temp_db_path();
+        let mut sm = CoreStateMachine::new_with_storage(&path, 100).unwrap();
+        
+        assert_eq!(sm.get_height(), 0);
+        
+        sm.set_height(100);
+        assert_eq!(sm.get_height(), 100);
+        
+        sm.set_height(200);
+        assert_eq!(sm.get_height(), 200);
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
