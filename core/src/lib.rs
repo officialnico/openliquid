@@ -5,6 +5,7 @@
 // Phase 3.3: Margin Trading & Liquidations
 // Phase 3.4: Advanced Margin & Perpetuals
 // Phase 3.5: Advanced Trading Features & Optimizations
+// Phase 3.6: Order Book Optimizations & Position Management
 //
 // This module provides the foundational order book data structures,
 // matching engine, persistence layer, and advanced perpetual futures
@@ -12,6 +13,7 @@
 
 pub mod adl;
 pub mod analytics;
+pub mod batch;
 pub mod checkpoint;
 pub mod fees;
 pub mod funding;
@@ -23,6 +25,8 @@ pub mod matching;
 pub mod oracle;
 pub mod orders;
 pub mod orderbook;
+pub mod position_manager;
+pub mod price_protection;
 pub mod risk;
 pub mod state_machine;
 pub mod storage;
@@ -31,6 +35,10 @@ pub mod types;
 // Re-export commonly used types
 pub use adl::{ADLCandidate, ADLEngine};
 pub use analytics::{Analytics, AssetStats, UserStats};
+pub use batch::{
+    BatchCancelRequest, BatchCancelResult, BatchOperations, BatchOrderBuilder, BatchOrderRequest,
+    BatchResult, OrderRequest,
+};
 pub use checkpoint::CheckpointManager;
 pub use fees::{FeeConfig, FeeEngine, FeeTier};
 pub use funding::{FundingConfig, FundingEngine, FundingPayment};
@@ -39,8 +47,10 @@ pub use insurance::InsuranceFund;
 pub use liquidation::{LiquidationEngine, LiquidationMode};
 pub use margin::{MarginConfig, MarginEngine, MarginMode};
 pub use oracle::{OracleConfig, OracleEngine, PriceSource};
-pub use orders::{AdvancedOrder, AdvancedOrderType, OrderManager};
-pub use orderbook::{OrderBook, OrderBookSnapshot, PriceLevel};
+pub use orders::{AdvancedOrder, AdvancedOrderType, LimitOrderParams, OrderManager, TimeInForce};
+pub use orderbook::{OrderBook, OrderBookCache, OrderBookSnapshot, PriceLevel};
+pub use position_manager::{ManagedPosition, PositionId, PositionManager};
+pub use price_protection::{PriceProtection, PriceProtectionConfig};
 pub use risk::{AssetRiskLimits, LeverageTier, PortfolioRiskLimits, RiskEngine};
 pub use state_machine::CoreStateMachine;
 pub use storage::{CheckpointMetadata, CoreStorage};

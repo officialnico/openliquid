@@ -4,6 +4,64 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Time-in-force for orders
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TimeInForce {
+    /// Good-til-cancelled (default) - order remains until filled or cancelled
+    GTC,
+    /// Immediate-or-cancel - fill what you can immediately, cancel rest
+    IOC,
+    /// Fill-or-kill - fill completely or cancel entire order
+    FOK,
+    /// Good-til-time - expire at timestamp
+    GTT(u64),
+    /// Post-only - add liquidity only, never take (reject if would match immediately)
+    PostOnly,
+}
+
+impl Default for TimeInForce {
+    fn default() -> Self {
+        TimeInForce::GTC
+    }
+}
+
+/// Limit order parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitOrderParams {
+    pub price: Price,
+    pub size: Size,
+    pub time_in_force: TimeInForce,
+    pub reduce_only: bool,  // Only reduce position, don't increase
+    pub post_only: bool,    // Reject if would match immediately (convenience flag)
+}
+
+impl LimitOrderParams {
+    pub fn new(price: Price, size: Size) -> Self {
+        Self {
+            price,
+            size,
+            time_in_force: TimeInForce::GTC,
+            reduce_only: false,
+            post_only: false,
+        }
+    }
+    
+    pub fn with_time_in_force(mut self, tif: TimeInForce) -> Self {
+        self.time_in_force = tif;
+        self
+    }
+    
+    pub fn with_reduce_only(mut self, reduce_only: bool) -> Self {
+        self.reduce_only = reduce_only;
+        self
+    }
+    
+    pub fn with_post_only(mut self, post_only: bool) -> Self {
+        self.post_only = post_only;
+        self
+    }
+}
+
 /// Advanced order types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AdvancedOrderType {
@@ -55,6 +113,51 @@ impl OrderManager {
             next_id: 1,
             highest_prices: HashMap::new(),
         }
+    }
+    
+    /// Check if order params are valid for the given position
+    pub fn validate_order_params(
+        &self,
+        params: &LimitOrderParams,
+        current_timestamp: u64,
+    ) -> Result<()> {
+        // Validate GTT expiration time
+        if let TimeInForce::GTT(expiry) = params.time_in_force {
+            if expiry <= current_timestamp {
+                return Err(anyhow!("GTT expiration time must be in the future"));
+            }
+        }
+        
+        // Validate post_only flag matches TimeInForce
+        if params.post_only && !matches!(params.time_in_force, TimeInForce::PostOnly) {
+            return Err(anyhow!("post_only flag requires PostOnly TimeInForce"));
+        }
+        
+        Ok(())
+    }
+    
+    /// Check if order with GTT has expired
+    pub fn is_order_expired(&self, time_in_force: &TimeInForce, current_timestamp: u64) -> bool {
+        if let TimeInForce::GTT(expiry) = time_in_force {
+            current_timestamp >= *expiry
+        } else {
+            false
+        }
+    }
+    
+    /// Check if order requires post-only behavior
+    pub fn is_post_only(&self, params: &LimitOrderParams) -> bool {
+        params.post_only || matches!(params.time_in_force, TimeInForce::PostOnly)
+    }
+    
+    /// Check if order is immediate-or-cancel
+    pub fn is_ioc(&self, time_in_force: &TimeInForce) -> bool {
+        matches!(time_in_force, TimeInForce::IOC)
+    }
+    
+    /// Check if order is fill-or-kill
+    pub fn is_fok(&self, time_in_force: &TimeInForce) -> bool {
+        matches!(time_in_force, TimeInForce::FOK)
     }
     
     /// Place stop-loss order
@@ -548,5 +651,86 @@ mod tests {
         // Second check - should not trigger again
         let triggered = manager.check_triggers(AssetId(1), Price::from_float(93.0));
         assert_eq!(triggered.len(), 0);
+    }
+
+    #[test]
+    fn test_time_in_force_gtc_default() {
+        let tif = TimeInForce::default();
+        assert_eq!(tif, TimeInForce::GTC);
+    }
+
+    #[test]
+    fn test_limit_order_params_builder() {
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)))
+            .with_time_in_force(TimeInForce::IOC)
+            .with_reduce_only(true)
+            .with_post_only(false);
+        
+        assert_eq!(params.time_in_force, TimeInForce::IOC);
+        assert!(params.reduce_only);
+        assert!(!params.post_only);
+    }
+
+    #[test]
+    fn test_validate_gtt_expiry() {
+        let manager = OrderManager::new();
+        let current_time = 1000;
+        
+        // Future expiry - valid
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)))
+            .with_time_in_force(TimeInForce::GTT(2000));
+        assert!(manager.validate_order_params(&params, current_time).is_ok());
+        
+        // Past expiry - invalid
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)))
+            .with_time_in_force(TimeInForce::GTT(500));
+        assert!(manager.validate_order_params(&params, current_time).is_err());
+    }
+
+    #[test]
+    fn test_is_order_expired() {
+        let manager = OrderManager::new();
+        
+        // GTT expired
+        assert!(manager.is_order_expired(&TimeInForce::GTT(1000), 1500));
+        
+        // GTT not expired
+        assert!(!manager.is_order_expired(&TimeInForce::GTT(2000), 1500));
+        
+        // GTC never expires
+        assert!(!manager.is_order_expired(&TimeInForce::GTC, 1500));
+    }
+
+    #[test]
+    fn test_is_post_only() {
+        let manager = OrderManager::new();
+        
+        // Post-only via TimeInForce
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)))
+            .with_time_in_force(TimeInForce::PostOnly);
+        assert!(manager.is_post_only(&params));
+        
+        // Post-only via flag
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)))
+            .with_post_only(true);
+        assert!(manager.is_post_only(&params));
+        
+        // Not post-only
+        let params = LimitOrderParams::new(Price::from_float(100.0), Size(U256::from(10)));
+        assert!(!manager.is_post_only(&params));
+    }
+
+    #[test]
+    fn test_is_ioc() {
+        let manager = OrderManager::new();
+        assert!(manager.is_ioc(&TimeInForce::IOC));
+        assert!(!manager.is_ioc(&TimeInForce::GTC));
+    }
+
+    #[test]
+    fn test_is_fok() {
+        let manager = OrderManager::new();
+        assert!(manager.is_fok(&TimeInForce::FOK));
+        assert!(!manager.is_fok(&TimeInForce::GTC));
     }
 }

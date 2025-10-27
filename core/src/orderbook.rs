@@ -4,6 +4,14 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+/// Cached best bid/ask for O(1) access
+#[derive(Debug, Clone)]
+pub struct OrderBookCache {
+    pub best_bid: Option<(Price, U256)>,
+    pub best_ask: Option<(Price, U256)>,
+    pub mid_price: Option<Price>,
+}
+
 /// Price level containing orders at a specific price
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
@@ -77,6 +85,10 @@ pub struct OrderBook {
     order_index: HashMap<OrderId, (Price, Side)>,
     /// Next order ID
     pub(crate) next_order_id: OrderId,
+    /// Cached best prices for performance
+    cache: OrderBookCache,
+    /// Self-trade prevention enabled
+    pub self_trade_prevention: bool,
 }
 
 impl OrderBook {
@@ -87,17 +99,59 @@ impl OrderBook {
             asks: BTreeMap::new(),
             order_index: HashMap::new(),
             next_order_id: 1,
+            cache: OrderBookCache {
+                best_bid: None,
+                best_ask: None,
+                mid_price: None,
+            },
+            self_trade_prevention: true,
         }
     }
     
-    /// Get best bid price (highest buy price)
-    pub fn best_bid(&self) -> Option<Price> {
-        self.bids.keys().next_back().copied()
+    /// Create order book with self-trade prevention setting
+    pub fn with_self_trade_prevention(asset: AssetId, enabled: bool) -> Self {
+        let mut book = Self::new(asset);
+        book.self_trade_prevention = enabled;
+        book
     }
     
-    /// Get best ask price (lowest sell price)
+    /// Update cache after order book change
+    fn update_cache(&mut self) {
+        self.cache.best_bid = self.bids.iter().next_back()
+            .map(|(p, level)| (*p, level.total_size));
+        self.cache.best_ask = self.asks.iter().next()
+            .map(|(p, level)| (*p, level.total_size));
+        
+        if let (Some((bid, _)), Some((ask, _))) = (self.cache.best_bid, self.cache.best_ask) {
+            self.cache.mid_price = Some(Price((bid.0 + ask.0) / 2));
+        } else {
+            self.cache.mid_price = None;
+        }
+    }
+    
+    /// Get best bid price (highest buy price) - O(1) cached
+    pub fn best_bid(&self) -> Option<Price> {
+        self.cache.best_bid.map(|(p, _)| p)
+    }
+    
+    /// Get best ask price (lowest sell price) - O(1) cached
     pub fn best_ask(&self) -> Option<Price> {
-        self.asks.keys().next().copied()
+        self.cache.best_ask.map(|(p, _)| p)
+    }
+    
+    /// Get best bid with size - O(1) cached
+    pub fn get_best_bid(&self) -> Option<(Price, U256)> {
+        self.cache.best_bid
+    }
+    
+    /// Get best ask with size - O(1) cached
+    pub fn get_best_ask(&self) -> Option<(Price, U256)> {
+        self.cache.best_ask
+    }
+    
+    /// Get mid price (average of bid/ask) - O(1) cached
+    pub fn get_mid_price(&self) -> Option<Price> {
+        self.cache.mid_price
     }
     
     /// Get current spread
@@ -106,6 +160,50 @@ impl OrderBook {
             (Some(bid), Some(ask)) if ask.0 > bid.0 => Some(Price(ask.0 - bid.0)),
             _ => None,
         }
+    }
+    
+    /// Check if order would match with same user's orders (self-trade)
+    pub fn would_self_trade(&self, trader: &Address, side: Side) -> bool {
+        let tree = match side {
+            Side::Bid => &self.asks,  // Bid would match asks
+            Side::Ask => &self.bids,  // Ask would match bids
+        };
+        
+        tree.values()
+            .flat_map(|level| &level.orders)
+            .any(|o| o.trader == *trader)
+    }
+    
+    /// Get user's orders that would self-trade with new order
+    pub fn get_self_trade_orders(&self, trader: &Address, side: Side) -> Vec<OrderId> {
+        let tree = match side {
+            Side::Bid => &self.asks,
+            Side::Ask => &self.bids,
+        };
+        
+        tree.values()
+            .flat_map(|level| &level.orders)
+            .filter(|o| o.trader == *trader)
+            .map(|o| o.id)
+            .collect()
+    }
+    
+    /// Prevent self-trade by cancelling conflicting orders
+    pub fn prevent_self_trade(&mut self, trader: &Address, side: Side) -> Vec<OrderId> {
+        if !self.self_trade_prevention {
+            return Vec::new();
+        }
+        
+        let order_ids = self.get_self_trade_orders(trader, side);
+        let mut cancelled = Vec::new();
+        
+        for order_id in order_ids {
+            if let Ok(_) = self.cancel_order(order_id) {
+                cancelled.push(order_id);
+            }
+        }
+        
+        cancelled
     }
     
     /// Add a limit order to the book
@@ -132,6 +230,9 @@ impl OrderBook {
             .add_order(order);
         
         self.order_index.insert(order_id, (price, side));
+        
+        // Update cache after adding order
+        self.update_cache();
         
         order_id
     }
@@ -160,6 +261,9 @@ impl OrderBook {
         if level.is_empty() {
             tree.remove(&price);
         }
+        
+        // Update cache after removing order
+        self.update_cache();
         
         Ok(order)
     }
@@ -470,6 +574,121 @@ mod tests {
         
         // Spread should be None when crossed
         assert_eq!(book.spread(), None);
+    }
+
+    #[test]
+    fn test_orderbook_cache_best_bid_ask() {
+        let mut book = OrderBook::new(AssetId(1));
+        
+        book.add_limit_order(Address::ZERO, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        book.add_limit_order(Address::ZERO, Side::Ask, Price(1_010_000), Size(U256::from(200)), 1);
+        
+        let (bid_price, bid_size) = book.get_best_bid().unwrap();
+        assert_eq!(bid_price, Price(1_000_000));
+        assert_eq!(bid_size, U256::from(100));
+        
+        let (ask_price, ask_size) = book.get_best_ask().unwrap();
+        assert_eq!(ask_price, Price(1_010_000));
+        assert_eq!(ask_size, U256::from(200));
+    }
+
+    #[test]
+    fn test_orderbook_cache_mid_price() {
+        let mut book = OrderBook::new(AssetId(1));
+        
+        assert_eq!(book.get_mid_price(), None);
+        
+        book.add_limit_order(Address::ZERO, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        book.add_limit_order(Address::ZERO, Side::Ask, Price(1_010_000), Size(U256::from(100)), 1);
+        
+        let mid_price = book.get_mid_price().unwrap();
+        assert_eq!(mid_price, Price(1_005_000));
+    }
+
+    #[test]
+    fn test_orderbook_cache_updates_on_cancel() {
+        let mut book = OrderBook::new(AssetId(1));
+        
+        let id1 = book.add_limit_order(Address::ZERO, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        let id2 = book.add_limit_order(Address::ZERO, Side::Bid, Price(990_000), Size(U256::from(100)), 1);
+        
+        assert_eq!(book.best_bid(), Some(Price(1_000_000)));
+        
+        book.cancel_order(id1).unwrap();
+        assert_eq!(book.best_bid(), Some(Price(990_000)));
+        
+        book.cancel_order(id2).unwrap();
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.get_mid_price(), None);
+    }
+
+    #[test]
+    fn test_would_self_trade() {
+        let mut book = OrderBook::new(AssetId(1));
+        let user = Address::repeat_byte(1);
+        
+        // User places a bid
+        book.add_limit_order(user, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        
+        // User placing an ask would self-trade
+        assert!(book.would_self_trade(&user, Side::Ask));
+        
+        // Different user would not self-trade
+        let other_user = Address::repeat_byte(2);
+        assert!(!book.would_self_trade(&other_user, Side::Ask));
+    }
+
+    #[test]
+    fn test_get_self_trade_orders() {
+        let mut book = OrderBook::new(AssetId(1));
+        let user = Address::repeat_byte(1);
+        
+        let id1 = book.add_limit_order(user, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        let id2 = book.add_limit_order(user, Side::Bid, Price(990_000), Size(U256::from(100)), 1);
+        
+        let self_trade_orders = book.get_self_trade_orders(&user, Side::Ask);
+        assert_eq!(self_trade_orders.len(), 2);
+        assert!(self_trade_orders.contains(&id1));
+        assert!(self_trade_orders.contains(&id2));
+    }
+
+    #[test]
+    fn test_prevent_self_trade() {
+        let mut book = OrderBook::new(AssetId(1));
+        let user = Address::repeat_byte(1);
+        
+        book.add_limit_order(user, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        book.add_limit_order(user, Side::Bid, Price(990_000), Size(U256::from(100)), 1);
+        
+        // Prevent self-trade should cancel user's bids
+        let cancelled = book.prevent_self_trade(&user, Side::Ask);
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(book.bids.len(), 0);
+    }
+
+    #[test]
+    fn test_self_trade_prevention_disabled() {
+        let mut book = OrderBook::with_self_trade_prevention(AssetId(1), false);
+        let user = Address::repeat_byte(1);
+        
+        book.add_limit_order(user, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        
+        // Should not cancel anything when disabled
+        let cancelled = book.prevent_self_trade(&user, Side::Ask);
+        assert_eq!(cancelled.len(), 0);
+        assert_eq!(book.bids.len(), 1);
+    }
+
+    #[test]
+    fn test_cache_with_multiple_orders_same_level() {
+        let mut book = OrderBook::new(AssetId(1));
+        
+        book.add_limit_order(Address::ZERO, Side::Bid, Price(1_000_000), Size(U256::from(100)), 0);
+        book.add_limit_order(Address::repeat_byte(1), Side::Bid, Price(1_000_000), Size(U256::from(200)), 1);
+        
+        let (price, size) = book.get_best_bid().unwrap();
+        assert_eq!(price, Price(1_000_000));
+        assert_eq!(size, U256::from(300));  // Total size at level
     }
 }
 
