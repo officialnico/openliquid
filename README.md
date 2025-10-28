@@ -1,3 +1,5 @@
+<img width="1000" height="255" alt="Group 1 (1)" src="https://github.com/user-attachments/assets/30baca4f-b556-4991-8456-07175770ad1b" />
+
 # OpenLiquid
 
 An open-source, high-performance decentralized exchange (DEX) with on-chain order books, inspired by Hyperliquid.
